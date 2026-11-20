@@ -1,23 +1,19 @@
 use crate::byte_source::BufferByteSource;
-use crate::common::*;
+use crate::common::{
+    AU_FORMAT_VERSION, MAX_METADATA_SIZE, Marker, SMALL_INT_NEGATIVE, SMALL_INT_POSITIVE,
+};
 use crate::error::ParseError;
 use crate::handler::{RecordHandler, ValueHandler};
 
 const MAX_DEPTH: usize = 2048;
 
 fn expect(source: &mut BufferByteSource, expected: u8) -> Result<(), ParseError> {
-    let c = source.next();
-    if c.is_eof() {
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new(format!("Unexpected EOF, expected 0x{expected:02x}")))?;
+    if c != expected {
         return Err(ParseError::new(format!(
-            "Unexpected EOF, expected 0x{:02x}",
-            expected
-        )));
-    }
-    if c.value() != expected {
-        return Err(ParseError::new(format!(
-            "Unexpected character: 0x{:02x}, expected 0x{:02x}",
-            c.value(),
-            expected
+            "Unexpected character: 0x{c:02x}, expected 0x{expected:02x}"
         )));
     }
     Ok(())
@@ -45,11 +41,9 @@ fn read_varint(source: &mut BufferByteSource) -> Result<u64, ParseError> {
         if shift >= 64 {
             return Err(ParseError::new("Bad varint encoding"));
         }
-        let next = source.next();
-        if next.is_eof() {
-            return Err(ParseError::new("Unexpected end of file"));
-        }
-        let i = next.value();
+        let i = source
+            .next_byte()
+            .ok_or_else(|| ParseError::new("Unexpected end of file"))?;
         result |= ((i & 0x7f) as u64) << shift;
         shift += 7;
         if (i & 0x80) == 0 {
@@ -60,23 +54,20 @@ fn read_varint(source: &mut BufferByteSource) -> Result<u64, ParseError> {
 }
 
 fn parse_format_version(source: &mut BufferByteSource) -> Result<u64, ParseError> {
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Expected version number, got EOF"));
-    }
-    let version;
-    if (c.value() & !0x1f) == SMALL_INT_POSITIVE {
-        version = (c.value() & 0x1f) as u64;
-    } else if c.value() == Marker::Varint as u8 {
-        version = read_varint(source)?;
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Expected version number, got EOF"))?;
+    let version = if (c & !0x1f) == SMALL_INT_POSITIVE {
+        (c & 0x1f) as u64
+    } else if c == Marker::Varint as u8 {
+        read_varint(source)?
     } else {
         return Err(ParseError::new("Expected version number"));
-    }
+    };
 
     if version != AU_FORMAT_VERSION as u64 {
         return Err(ParseError::new(format!(
-            "Bad format version: expected {}, got {}",
-            AU_FORMAT_VERSION, version
+            "Bad format version: expected {AU_FORMAT_VERSION}, got {version}"
         )));
     }
     Ok(version)
@@ -112,8 +103,7 @@ fn parse_string_length(source: &mut BufferByteSource, tag: u8) -> Result<usize, 
         Ok(read_varint(source)? as usize)
     } else {
         Err(ParseError::new(format!(
-            "Expected a string, got 0x{:02x}",
-            tag
+            "Expected a string, got 0x{tag:02x}"
         )))
     }
 }
@@ -123,11 +113,10 @@ fn parse_full_string_record(
     handler: &mut impl RecordHandler,
 ) -> Result<(), ParseError> {
     let sov = source.pos();
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Expected a string, got EOF"));
-    }
-    let len = parse_string_length(source, c.value())?;
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Expected a string, got EOF"))?;
+    let len = parse_string_length(source, c)?;
     handler.on_string_start(sov, len);
     let data = source.read_bytes(len)?;
     handler.on_string_fragment(data);
@@ -146,20 +135,19 @@ pub fn parse_value<H: ValueHandler>(
     }
 
     let sov = source.pos();
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Unexpected EOF at start of value"));
-    }
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Unexpected EOF at start of value"))?;
 
     // High bit set -> small dict ref
-    if c.value() & 0x80 != 0 {
-        handler.on_dict_ref(sov, (c.value() & !0x80) as usize);
+    if c & 0x80 != 0 {
+        handler.on_dict_ref(sov, (c & !0x80) as usize);
         return Ok(());
     }
 
-    let val = c.value() & !0xe0;
-    if c.value() & SMALL_INT_NEGATIVE != 0 {
-        if c.value() & 0x20 != 0 {
+    let val = c & !0xe0;
+    if c & SMALL_INT_NEGATIVE != 0 {
+        if c & 0x20 != 0 {
             // Positive small int
             handler.on_uint(sov, val as u64);
         } else {
@@ -168,83 +156,81 @@ pub fn parse_value<H: ValueHandler>(
         }
         return Ok(());
     }
-    if c.value() & 0x20 != 0 {
+    if c & 0x20 != 0 {
         // Inline string
         parse_string_data(source, sov, val as usize, handler)?;
         return Ok(());
     }
 
-    match c.value() {
-        x if x == Marker::True as u8 => handler.on_bool(sov, true),
-        x if x == Marker::False as u8 => handler.on_bool(sov, false),
-        x if x == Marker::Null as u8 => handler.on_null(sov),
-        x if x == Marker::Varint as u8 => {
+    match Marker::try_from(c) {
+        Ok(Marker::True) => handler.on_bool(sov, true),
+        Ok(Marker::False) => handler.on_bool(sov, false),
+        Ok(Marker::Null) => handler.on_null(sov),
+        Ok(Marker::Varint) => {
             let v = read_varint(source)?;
             handler.on_uint(sov, v);
         }
-        x if x == Marker::NegVarint as u8 => {
+        Ok(Marker::NegVarint) => {
             let v = read_varint(source)?;
             let neg_int_limit: u64 = (i64::MAX as u64) + 1;
             if v > neg_int_limit {
                 return Err(ParseError::new(format!(
-                    "Signed int overflows i64: (-){} 0x{:016x}",
-                    v, v
+                    "Signed int overflows i64: (-){v} 0x{v:016x}"
                 )));
             }
             handler.on_int(sov, -(v as i64));
         }
-        x if x == Marker::PosInt64 as u8 => {
+        Ok(Marker::PosInt64) => {
             let val = read_le_u64(source)?;
             handler.on_uint(sov, val);
         }
-        x if x == Marker::NegInt64 as u8 => {
+        Ok(Marker::NegInt64) => {
             let val = read_le_u64(source)?;
             let neg_int_limit: u64 = (i64::MAX as u64) + 1;
             if val > neg_int_limit {
                 return Err(ParseError::new(format!(
-                    "Signed int overflows i64: (-){} 0x{:016x}",
-                    val, val
+                    "Signed int overflows i64: (-){val} 0x{val:016x}"
                 )));
             }
             // 0 should be encoded as PosInt64, so val >= 1 for NegInt64
             // Use wrapping arithmetic to handle i64::MIN correctly
             handler.on_int(sov, (val as i64).wrapping_neg());
         }
-        x if x == Marker::Double as u8 => {
+        Ok(Marker::Double) => {
             let v = read_double(source)?;
             handler.on_double(sov, v);
         }
-        x if x == Marker::Timestamp as u8 => {
+        Ok(Marker::Timestamp) => {
             let v = read_le_u64(source)?;
             handler.on_time(sov, v);
         }
-        x if x == Marker::DictRef as u8 => {
+        Ok(Marker::DictRef) => {
             let v = read_varint(source)? as usize;
             handler.on_dict_ref(sov, v);
         }
-        x if x == Marker::String as u8 => {
+        Ok(Marker::String) => {
             parse_string_with_varint_len(source, sov, handler)?;
         }
-        x if x == Marker::ArrayStart as u8 => {
+        Ok(Marker::ArrayStart) => {
             handler.on_array_start();
             loop {
-                let p = source.peek();
-                if p == Marker::ArrayEnd as u8 { break; }
-                if p.is_eof() {
-                    return Err(ParseError::new("Unexpected EOF in array"));
+                match source.peek() {
+                    Some(b) if b == Marker::ArrayEnd as u8 => break,
+                    None => return Err(ParseError::new("Unexpected EOF in array")),
+                    _ => {}
                 }
                 parse_value(source, handler, depth + 1)?;
             }
             expect(source, Marker::ArrayEnd as u8)?;
             handler.on_array_end();
         }
-        x if x == Marker::ObjectStart as u8 => {
+        Ok(Marker::ObjectStart) => {
             handler.on_object_start();
             loop {
-                let p = source.peek();
-                if p == Marker::ObjectEnd as u8 { break; }
-                if p.is_eof() {
-                    return Err(ParseError::new("Unexpected EOF in object"));
+                match source.peek() {
+                    Some(b) if b == Marker::ObjectEnd as u8 => break,
+                    None => return Err(ParseError::new("Unexpected EOF in object")),
+                    _ => {}
                 }
                 parse_key(source, handler)?;
                 parse_value(source, handler, depth + 1)?;
@@ -252,10 +238,9 @@ pub fn parse_value<H: ValueHandler>(
             expect(source, Marker::ObjectEnd as u8)?;
             handler.on_object_end();
         }
-        other => {
+        _ => {
             return Err(ParseError::new(format!(
-                "Unexpected character at start of value: 0x{:02x}",
-                other
+                "Unexpected character at start of value: 0x{c:02x}"
             )));
         }
     }
@@ -267,31 +252,29 @@ fn parse_key<H: ValueHandler>(
     handler: &mut H,
 ) -> Result<(), ParseError> {
     let sov = source.pos();
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Unexpected EOF at start of key"));
-    }
-    if c.value() & 0x80 != 0 {
-        handler.on_dict_ref(sov, (c.value() & !0x80) as usize);
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Unexpected EOF at start of key"))?;
+    if c & 0x80 != 0 {
+        handler.on_dict_ref(sov, (c & !0x80) as usize);
         return Ok(());
     }
-    let val = c.value() & !0xe0;
-    if (c.value() & !0x1f) == 0x20 {
+    let val = c & !0xe0;
+    if (c & !0x1f) == 0x20 {
         parse_string_data(source, sov, val as usize, handler)?;
         return Ok(());
     }
-    match c.value() {
-        x if x == Marker::DictRef as u8 => {
+    match Marker::try_from(c) {
+        Ok(Marker::DictRef) => {
             let v = read_varint(source)? as usize;
             handler.on_dict_ref(sov, v);
         }
-        x if x == Marker::String as u8 => {
+        Ok(Marker::String) => {
             parse_string_with_varint_len(source, sov, handler)?;
         }
-        other => {
+        _ => {
             return Err(ParseError::new(format!(
-                "Unexpected character at start of key: 0x{:02x}",
-                other
+                "Unexpected character at start of key: 0x{c:02x}"
             )));
         }
     }
@@ -308,11 +291,10 @@ fn parse_full_string_to_string(
     source: &mut BufferByteSource,
     max_len: usize,
 ) -> Result<String, ParseError> {
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Expected a string, got EOF"));
-    }
-    let len = parse_string_length(source, c.value())?;
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Expected a string, got EOF"))?;
+    let len = parse_string_length(source, c)?;
     if len > max_len {
         return Err(ParseError::new("String too long"));
     }
@@ -325,13 +307,12 @@ pub fn parse_record<H: RecordHandler>(
     source: &mut BufferByteSource,
     handler: &mut H,
 ) -> Result<bool, ParseError> {
-    let c = source.next();
-    if c.is_eof() {
-        return Err(ParseError::new("Unexpected EOF at start of record"));
-    }
+    let c = source
+        .next_byte()
+        .ok_or_else(|| ParseError::new("Unexpected EOF at start of record"))?;
     handler.on_record_start(source.pos() - 1);
 
-    match c.value() {
+    match c {
         b'H' => {
             expect(source, b'A')?;
             expect(source, b'U')?;
@@ -350,9 +331,11 @@ pub fn parse_record<H: RecordHandler>(
         b'A' => {
             let backref = read_backref(source)?;
             handler.on_dict_add_start(backref as usize);
-            while source.peek() != Marker::RecordEnd as u8 {
-                if source.peek().is_eof() {
-                    return Err(ParseError::new("Unexpected EOF in dict add"));
+            loop {
+                match source.peek() {
+                    Some(b) if b == Marker::RecordEnd as u8 => break,
+                    None => return Err(ParseError::new("Unexpected EOF in dict add")),
+                    _ => {}
                 }
                 parse_full_string_record(source, handler)?;
             }
@@ -362,8 +345,12 @@ pub fn parse_record<H: RecordHandler>(
         b'V' => {
             let backref = read_backref(source)?;
             let len = read_varint(source)? as usize;
+            // `len` covers the value plus its 2-byte terminator (RecordEnd + '\n').
+            let value_len = len.checked_sub(2).ok_or_else(|| {
+                ParseError::new(format!("Value record length too small: {len}"))
+            })?;
             let start_of_value = source.pos();
-            handler.on_value(backref as usize, len - 2, source);
+            handler.on_value(backref as usize, value_len, source)?;
             term(source)?;
             if source.pos() - start_of_value != len {
                 return Err(ParseError::new(
@@ -373,8 +360,7 @@ pub fn parse_record<H: RecordHandler>(
             Ok(true)
         }
         other => Err(ParseError::new(format!(
-            "Unexpected character at start of record: 0x{:02x}",
-            other
+            "Unexpected character at start of record: 0x{other:02x}"
         ))),
     }
 }
@@ -388,38 +374,36 @@ pub fn parse_stream<H: RecordHandler>(
     if expect_header {
         check_header(source)?;
     }
-    while !source.peek().is_eof() {
+    while source.peek().is_some() {
         parse_record(source, handler)?;
     }
     Ok(())
 }
 
 fn check_header(source: &mut BufferByteSource) -> Result<(), ParseError> {
-    if source.peek().is_eof() {
+    let not_au = || ParseError::new("This file doesn't appear to start with an au header record");
+
+    // Empty input is not an error: there are simply no records to parse.
+    if source.peek().is_none() {
         return Ok(());
     }
 
-    if source.peek().value() != b'H' {
-        return Err(ParseError::new(
-            "This file doesn't appear to start with an au header record",
-        ));
+    // Verify the `HAU` magic explicitly. Whether the input is au at all and
+    // whether we can decode its version are separate questions: a wrong magic
+    // means "not au", but a correct magic with an unsupported version should be
+    // reported as a version error, not misdiagnosed as non-au input. This
+    // consumes the header record, so `parse_stream` continues from the first
+    // dictionary/value record.
+    if source.next_byte() != Some(b'H')
+        || source.next_byte() != Some(b'A')
+        || source.next_byte() != Some(b'U')
+    {
+        return Err(not_au());
     }
 
-    struct HeaderCheck {
-        header_seen: bool,
-    }
-    impl RecordHandler for HeaderCheck {
-        fn on_header(&mut self, _version: u64, _metadata: &str) {
-            self.header_seen = true;
-        }
-    }
-
-    let mut hh = HeaderCheck { header_seen: false };
-    let _ = parse_record(source, &mut hh);
-    if !hh.header_seen {
-        return Err(ParseError::new(
-            "This file doesn't appear to start with an au header record",
-        ));
-    }
+    // Magic matched: it's an au file. Surface version/metadata errors verbatim.
+    parse_format_version(source)?;
+    parse_full_string_to_string(source, MAX_METADATA_SIZE)?;
+    term(source)?;
     Ok(())
 }

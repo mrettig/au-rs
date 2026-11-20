@@ -2,14 +2,22 @@ use std::fmt;
 
 #[derive(Debug)]
 pub struct ParseError {
-    pub message: String,
+    message: String,
 }
 
 impl ParseError {
+    #[must_use]
     pub fn new(msg: impl Into<String>) -> Self {
-        ParseError {
+        Self {
             message: msg.into(),
         }
+    }
+
+    /// The human-readable error message.
+    #[inline]
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 

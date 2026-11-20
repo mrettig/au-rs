@@ -1,6 +1,7 @@
 use crate::byte_source::BufferByteSource;
 use crate::decoder::parse_value;
 use crate::dictionary::Dictionary;
+use crate::error::ParseError;
 use crate::handler::{RecordHandler, ValueHandler};
 
 pub struct AuRecordHandler<'a, V: ValueHandler> {
@@ -43,21 +44,33 @@ impl<V: ValueHandler> RecordHandler for AuRecordHandler<'_, V> {
         }
     }
 
-    fn on_value(&mut self, rel_dict_pos: usize, len: usize, source: &mut BufferByteSource) {
+    fn on_value(
+        &mut self,
+        rel_dict_pos: usize,
+        len: usize,
+        source: &mut BufferByteSource,
+    ) -> Result<(), ParseError> {
         if let Ok(dict) = self.dictionary.find_dictionary_ref(self.sor, rel_dict_pos) {
             let mut wrapper = DictValueHandler {
                 inner: self.value_handler,
                 dict,
             };
-            let _ = parse_value(source, &mut wrapper, 0);
+            parse_value(source, &mut wrapper, 0)
         } else {
-            let _ = source.skip(len);
+            // No dictionary resolves this backref; skip the value's bytes so the
+            // stream stays aligned rather than surfacing a hard error.
+            source.skip(len)
         }
     }
 
     fn on_string_start(&mut self, _sov: usize, len: usize) {
+        // `len` is an attacker-controlled capacity hint; the bytes themselves are
+        // bounds-checked as fragments arrive. Cap the hint so a bogus length
+        // can't request an absurd allocation (larger strings still grow as their
+        // fragments are appended).
+        const MAX_RESERVE_HINT: usize = 1 << 20;
         self.str_buf.clear();
-        self.str_buf.reserve(len);
+        let _ = self.str_buf.try_reserve(len.min(MAX_RESERVE_HINT));
     }
 
     fn on_string_end(&mut self) {
@@ -65,7 +78,7 @@ impl<V: ValueHandler> RecordHandler for AuRecordHandler<'_, V> {
             let s = String::from_utf8_lossy(&self.str_buf).into_owned();
             let sor = self.sor;
             if let Some(dict) = self.dictionary.latest() {
-                dict.add(sor, &s);
+                dict.add(sor, s);
             }
         }
     }
@@ -82,16 +95,36 @@ struct DictValueHandler<'a, V: ValueHandler> {
 }
 
 impl<V: ValueHandler> ValueHandler for DictValueHandler<'_, V> {
-    fn on_object_start(&mut self) { self.inner.on_object_start(); }
-    fn on_object_end(&mut self) { self.inner.on_object_end(); }
-    fn on_array_start(&mut self) { self.inner.on_array_start(); }
-    fn on_array_end(&mut self) { self.inner.on_array_end(); }
-    fn on_null(&mut self, pos: usize) { self.inner.on_null(pos); }
-    fn on_bool(&mut self, pos: usize, val: bool) { self.inner.on_bool(pos, val); }
-    fn on_int(&mut self, pos: usize, val: i64) { self.inner.on_int(pos, val); }
-    fn on_uint(&mut self, pos: usize, val: u64) { self.inner.on_uint(pos, val); }
-    fn on_double(&mut self, pos: usize, val: f64) { self.inner.on_double(pos, val); }
-    fn on_time(&mut self, pos: usize, nanos: u64) { self.inner.on_time(pos, nanos); }
+    fn on_object_start(&mut self) {
+        self.inner.on_object_start();
+    }
+    fn on_object_end(&mut self) {
+        self.inner.on_object_end();
+    }
+    fn on_array_start(&mut self) {
+        self.inner.on_array_start();
+    }
+    fn on_array_end(&mut self) {
+        self.inner.on_array_end();
+    }
+    fn on_null(&mut self, pos: usize) {
+        self.inner.on_null(pos);
+    }
+    fn on_bool(&mut self, pos: usize, val: bool) {
+        self.inner.on_bool(pos, val);
+    }
+    fn on_int(&mut self, pos: usize, val: i64) {
+        self.inner.on_int(pos, val);
+    }
+    fn on_uint(&mut self, pos: usize, val: u64) {
+        self.inner.on_uint(pos, val);
+    }
+    fn on_double(&mut self, pos: usize, val: f64) {
+        self.inner.on_double(pos, val);
+    }
+    fn on_time(&mut self, pos: usize, nanos: u64) {
+        self.inner.on_time(pos, nanos);
+    }
 
     fn on_dict_ref(&mut self, pos: usize, dict_idx: usize) {
         if let Ok(s) = self.dict.at(dict_idx) {
@@ -104,7 +137,9 @@ impl<V: ValueHandler> ValueHandler for DictValueHandler<'_, V> {
     fn on_string_start(&mut self, sov: usize, length: usize) {
         self.inner.on_string_start(sov, length);
     }
-    fn on_string_end(&mut self) { self.inner.on_string_end(); }
+    fn on_string_end(&mut self) {
+        self.inner.on_string_end();
+    }
     fn on_string_fragment(&mut self, fragment: &[u8]) {
         self.inner.on_string_fragment(fragment);
     }

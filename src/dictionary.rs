@@ -7,8 +7,9 @@ pub struct Dict {
 }
 
 impl Dict {
+    #[must_use]
     pub fn new(start_pos: usize) -> Self {
-        Dict {
+        Self {
             dictionary: Vec::with_capacity(1 << 16),
             start_pos,
             last_dict_pos: start_pos,
@@ -21,12 +22,13 @@ impl Dict {
         self.last_dict_pos = sor;
     }
 
-    pub fn add(&mut self, sor: usize, value: &str) {
-        self.dictionary.push(value.to_string());
+    pub fn add(&mut self, sor: usize, value: String) {
+        self.dictionary.push(value);
         self.last_dict_pos = sor;
     }
 
-    pub fn includes(&self, sor: usize) -> bool {
+    #[must_use]
+    pub const fn includes(&self, sor: usize) -> bool {
         self.start_pos <= sor && sor <= self.last_dict_pos
     }
 
@@ -35,13 +37,17 @@ impl Dict {
             return Err(ParseError::new(format!(
                 "Dictionary reference index {} out of range. Dictionary started at position {}, \
                  last add occurred at position {}, and currently has {} entries.",
-                idx, self.start_pos, self.last_dict_pos, self.dictionary.len()
+                idx,
+                self.start_pos,
+                self.last_dict_pos,
+                self.dictionary.len()
             )));
         }
         Ok(&self.dictionary[idx])
     }
 
-    pub fn size(&self) -> usize {
+    #[must_use]
+    pub const fn size(&self) -> usize {
         self.dictionary.len()
     }
 }
@@ -52,22 +58,22 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_max_dicts(1)
     }
 
+    #[must_use]
     pub fn with_max_dicts(max_dicts: usize) -> Self {
-        Dictionary {
+        Self {
             dictionaries: Vec::with_capacity(max_dicts),
             max_dicts,
         }
     }
 
     pub fn clear(&mut self, sor: usize) -> &mut Dict {
-        for i in 0..self.dictionaries.len() {
-            if self.dictionaries[i].start_pos == sor {
-                return &mut self.dictionaries[i];
-            }
+        if let Some(idx) = self.dictionaries.iter().position(|d| d.start_pos == sor) {
+            return &mut self.dictionaries[idx];
         }
 
         if self.dictionaries.len() == self.max_dicts {
@@ -80,31 +86,43 @@ impl Dictionary {
         self.dictionaries.last_mut().unwrap()
     }
 
-    pub fn find_dictionary_ref(&self, sor: usize, rel_dict_pos: usize) -> Result<&Dict, ParseError> {
-        let pos = sor - rel_dict_pos;
-        for i in (0..self.dictionaries.len()).rev() {
-            if self.dictionaries[i].includes(pos) {
-                return Ok(&self.dictionaries[i]);
-            }
+    /// Resolve a relative backref to an absolute position, erroring rather than
+    /// underflowing when the backref points before the start of the stream.
+    fn abs_pos(sor: usize, rel_dict_pos: usize) -> Result<usize, ParseError> {
+        sor.checked_sub(rel_dict_pos).ok_or_else(|| {
+            ParseError::new(format!(
+                "wrong backref: relDictPos {rel_dict_pos} exceeds start-of-record {sor}"
+            ))
+        })
+    }
+
+    pub fn find_dictionary_ref(
+        &self,
+        sor: usize,
+        rel_dict_pos: usize,
+    ) -> Result<&Dict, ParseError> {
+        let pos = Self::abs_pos(sor, rel_dict_pos)?;
+        if let Some(dict) = self.dictionaries.iter().rev().find(|d| d.includes(pos)) {
+            return Ok(dict);
         }
         Err(ParseError::new(format!(
-            "wrong backref: no dictionary includes absolute position = {}: \
-             start-of-record = {} relDictPos = {}",
-            pos, sor, rel_dict_pos
+            "wrong backref: no dictionary includes absolute position = {pos}: \
+             start-of-record = {sor} relDictPos = {rel_dict_pos}"
         )))
     }
 
-    pub fn find_dictionary(&mut self, sor: usize, rel_dict_pos: usize) -> Result<&mut Dict, ParseError> {
-        let pos = sor - rel_dict_pos;
-        for i in (0..self.dictionaries.len()).rev() {
-            if self.dictionaries[i].includes(pos) {
-                return Ok(&mut self.dictionaries[i]);
-            }
+    pub fn find_dictionary(
+        &mut self,
+        sor: usize,
+        rel_dict_pos: usize,
+    ) -> Result<&mut Dict, ParseError> {
+        let pos = Self::abs_pos(sor, rel_dict_pos)?;
+        if let Some(idx) = self.dictionaries.iter().rposition(|d| d.includes(pos)) {
+            return Ok(&mut self.dictionaries[idx]);
         }
         Err(ParseError::new(format!(
-            "wrong backref: no dictionary includes absolute position = {}: \
-             start-of-record = {} relDictPos = {}",
-            pos, sor, rel_dict_pos
+            "wrong backref: no dictionary includes absolute position = {pos}: \
+             start-of-record = {sor} relDictPos = {rel_dict_pos}"
         )))
     }
 

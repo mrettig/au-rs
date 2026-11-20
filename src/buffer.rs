@@ -1,55 +1,64 @@
+/// A growable output buffer for encoded bytes.
+///
+/// Thin wrapper over `Vec<u8>`; `clear` retains the allocation so the buffer can
+/// be reused across records without reallocating.
+#[repr(transparent)]
 pub struct VectorBuffer {
     v: Vec<u8>,
-    idx: usize,
 }
 
 impl VectorBuffer {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(1024 * 1024)
     }
 
+    #[must_use]
     pub fn with_capacity(size: usize) -> Self {
-        VectorBuffer {
-            v: vec![0u8; size],
-            idx: 0,
+        Self {
+            v: Vec::with_capacity(size),
         }
     }
 
+    #[inline]
     pub fn put(&mut self, c: u8) {
-        if self.idx == self.v.len() {
-            self.v.resize(self.v.len() * 2, 0);
-        }
-        self.v[self.idx] = c;
-        self.idx += 1;
+        self.v.push(c);
     }
 
+    /// Reserve `size` zeroed bytes at the end and return them for in-place writing.
+    #[inline]
     pub fn raw(&mut self, size: usize) -> &mut [u8] {
-        if self.idx + size > self.v.len() {
-            let new_size = std::cmp::max(self.v.len() * 2, self.idx + size);
-            self.v.resize(new_size, 0);
-        }
-        let front = self.idx;
-        self.idx += size;
-        &mut self.v[front..front + size]
+        let start = self.v.len();
+        self.v.resize(start + size, 0);
+        &mut self.v[start..]
     }
 
+    #[inline]
     pub fn write_bytes(&mut self, data: &[u8]) {
-        if !data.is_empty() {
-            let dest = self.raw(data.len());
-            dest.copy_from_slice(data);
-        }
+        self.v.extend_from_slice(data);
     }
 
-    pub fn tellp(&self) -> usize {
-        self.idx
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.v.len()
     }
 
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
+    #[inline]
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.v[..self.idx]
+        &self.v
     }
 
+    #[inline]
     pub fn clear(&mut self) {
-        self.idx = 0;
+        self.v.clear();
     }
 }
 

@@ -1,3 +1,5 @@
+use schnellru::{ByLength, LruMap};
+use arcstr::ArcStr;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +18,7 @@ pub struct StringInternConfig {
 
 impl Default for StringInternConfig {
     fn default() -> Self {
-        StringInternConfig {
+        Self {
             tiny_str: 4,
             intern_thresh: 10,
             intern_cache_size: 1000,
@@ -25,68 +27,63 @@ impl Default for StringInternConfig {
     }
 }
 
+/// Tracks how often a candidate string has been seen, evicting the
+/// oldest-inserted entries once the cache is full. Backed by a bounded map so
+/// lookups and evictions are O(1) and memory stays capped at the cache size (no
+/// accumulating tombstones). Eviction is insertion-order (FIFO): counting a
+/// string does not refresh its position, matching the prior windowing policy.
 struct UsageTracker {
     intern_thresh: usize,
-    intern_cache_size: usize,
-    /// Ordered list of recently seen strings (front = oldest)
-    in_order: Vec<String>,
-    /// Maps string -> (count, index_in_in_order)
-    dict: HashMap<String, (usize, usize)>,
+    /// Maps candidate string -> times seen; capped at the cache size.
+    counts: LruMap<String, usize>,
 }
 
 impl UsageTracker {
     fn new(intern_thresh: usize, intern_cache_size: usize) -> Self {
-        UsageTracker {
+        // Fixed-seed hasher: this internal cache is not a HashDoS boundary, so
+        // we drop the randomized `runtime-rng` feature (and its getrandom dep).
+        const SEED: [u64; 4] = [
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        ];
+        // Saturate rather than wrap: a cache size >= 2^32 would otherwise
+        // truncate (and a value that wraps to 0 would disable interning).
+        let cap = u32::try_from(intern_cache_size).unwrap_or(u32::MAX);
+        Self {
             intern_thresh,
-            intern_cache_size,
-            in_order: Vec::new(),
-            dict: HashMap::new(),
+            counts: LruMap::with_seed(ByLength::new(cap), SEED),
         }
     }
 
     fn should_intern(&mut self, sv: &str) -> bool {
-        if let Some(entry) = self.dict.get_mut(sv) {
-            if entry.0 >= self.intern_thresh {
-                // Remove from tracking
-                let idx = entry.1;
-                self.dict.remove(sv);
-                // Mark slot as empty by clearing the string
-                if idx < self.in_order.len() {
-                    self.in_order[idx] = String::new();
-                }
-                return true;
-            } else {
-                entry.0 += 1;
-                return false;
+        // `peek_mut` reads/updates the count without touching eviction order, so
+        // eviction stays FIFO (oldest-inserted), matching the prior behavior.
+        match self.counts.peek_mut(sv) {
+            Some(count) if *count >= self.intern_thresh => {
+                // Threshold reached: promote to the real dictionary and stop tracking.
+                self.counts.remove(sv);
+                true
+            }
+            Some(count) => {
+                *count += 1;
+                false
+            }
+            None => {
+                // Inserting at capacity evicts the oldest-inserted entry.
+                self.counts.insert(sv.to_string(), 1);
+                false
             }
         }
-
-        // Evict oldest if at capacity
-        if self.dict.len() >= self.intern_cache_size {
-            // Find the oldest non-empty entry
-            for i in 0..self.in_order.len() {
-                if !self.in_order[i].is_empty() {
-                    let key = std::mem::take(&mut self.in_order[i]);
-                    self.dict.remove(&key);
-                    break;
-                }
-            }
-        }
-
-        let idx = self.in_order.len();
-        let s = sv.to_string();
-        self.dict.insert(s.clone(), (1, idx));
-        self.in_order.push(s);
-        false
     }
 
     fn clear(&mut self) {
-        self.dict.clear();
-        self.in_order.clear();
+        self.counts.clear();
     }
 
     fn size(&self) -> usize {
-        self.dict.len()
+        self.counts.len()
     }
 }
 
@@ -96,20 +93,22 @@ struct InternEntry {
 }
 
 pub struct StringIntern {
-    dict_in_order: Vec<String>,
-    dictionary: HashMap<String, InternEntry>,
+    dict_in_order: Vec<ArcStr>,
+    dictionary: HashMap<ArcStr, InternEntry>,
     tiny_string_size: usize,
     intern_cache: UsageTracker,
 }
 
 impl StringIntern {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_config(StringInternConfig::default())
     }
 
+    #[must_use]
     pub fn with_config(config: StringInternConfig) -> Self {
         let reserve_size = (config.clear_threshold as f64 * 1.2) as usize;
-        StringIntern {
+        Self {
             dict_in_order: Vec::with_capacity(reserve_size),
             dictionary: HashMap::with_capacity(reserve_size),
             tiny_string_size: config.tiny_str,
@@ -132,7 +131,9 @@ impl StringIntern {
 
         if intern == InternMode::ForceIntern || self.intern_cache.should_intern(sv) {
             let next_entry = self.dict_in_order.len();
-            let s = sv.to_string();
+            // `ArcStr` clone is a refcount bump, so keying the map and the index
+            // vec by the same string allocates once (and each slot is 8 bytes).
+            let s = ArcStr::from(sv);
             self.dictionary.insert(
                 s.clone(),
                 InternEntry {
@@ -146,7 +147,8 @@ impl StringIntern {
         None
     }
 
-    pub fn dict(&self) -> &[String] {
+    #[must_use]
+    pub fn dict(&self) -> &[ArcStr] {
         &self.dict_in_order
     }
 
@@ -178,10 +180,10 @@ impl StringIntern {
     }
 
     fn do_reindex(&mut self) {
-        let mut tmp_dict: Vec<(usize, String)> = self
+        let mut tmp_dict: Vec<(usize, ArcStr)> = self
             .dictionary
-            .iter()
-            .map(|(_, entry)| {
+            .values()
+            .map(|entry| {
                 (
                     entry.occurrences,
                     self.dict_in_order[entry.intern_index].clone(),
@@ -206,13 +208,22 @@ impl StringIntern {
         }
     }
 
-    pub fn get_stats(&self) -> HashMap<String, usize> {
-        let mut stats = HashMap::new();
-        stats.insert("HashSize".to_string(), self.dictionary.len());
-        stats.insert("DictSize".to_string(), self.dict_in_order.len());
-        stats.insert("CacheSize".to_string(), self.intern_cache.size());
-        stats
+    #[must_use]
+    pub fn get_stats(&self) -> InternStats {
+        InternStats {
+            hash_size: self.dictionary.len(),
+            dict_size: self.dict_in_order.len(),
+            cache_size: self.intern_cache.size(),
+        }
     }
+}
+
+/// Snapshot of a `StringIntern`'s internal sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternStats {
+    pub hash_size: usize,
+    pub dict_size: usize,
+    pub cache_size: usize,
 }
 
 impl Default for StringIntern {

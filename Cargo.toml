@@ -1,7 +1,29 @@
 [package]
 name = "au"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-serde_json = { version = "1", features = ["preserve_order"] }
+arcstr = "1.2.0"
+# default features off to drop the getrandom-backed `runtime-rng`; the internal
+# frequency cache does not need HashDoS-resistant seeding.
+schnellru = { version = "0.2.4", default-features = false }
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.11.0"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[[bench]]
+name = "au_bench"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+items_after_statements = "warn"
+missing_const_for_fn = "warn"
+redundant_else = "warn"
+uninlined_format_args = "warn"
+use_self = "warn"
